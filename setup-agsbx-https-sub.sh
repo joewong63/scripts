@@ -2,13 +2,16 @@
 set -euo pipefail
 
 # HTTPS subscription service for Argosbx-generated files.
-# It serves files directly from SOURCE_DIR, so file updates are visible immediately.
+# It serves a dedicated directory that only contains symlinks to the source files,
+# so source file updates are visible immediately without copying.
 
 SCRIPT_NAME="${0##*/}"
 
 STATE_DIR="/etc/agsbx-https-sub"
 STATE_FILE="$STATE_DIR/config.env"
 TOKEN_FILE="$STATE_DIR/token"
+DATA_DIR="/var/lib/agsbx-https-sub"
+PUBLIC_ROOT="$DATA_DIR/public"
 CADDY_CONF_DIR="/etc/caddy/conf.d"
 CADDY_SNIPPET="$CADDY_CONF_DIR/agsbx-sub.caddy"
 CADDY_PLACEHOLDER="$CADDY_CONF_DIR/00-empty.caddy"
@@ -270,6 +273,7 @@ write_state() {
 
   {
     printf 'SOURCE_DIR=%q\n' "$SOURCE_DIR"
+    printf 'PUBLIC_ROOT=%q\n' "$PUBLIC_ROOT"
     printf 'HTTPS_HOST=%q\n' "$HTTPS_HOST"
     printf 'HTTPS_PORT=%q\n' "$HTTPS_PORT"
     printf 'TOKEN=%q\n' "$TOKEN"
@@ -284,6 +288,7 @@ load_state() {
   . "$STATE_FILE"
 
   [ -n "${SOURCE_DIR:-}" ] || die "saved SOURCE_DIR is empty"
+  PUBLIC_ROOT="${PUBLIC_ROOT:-$DATA_DIR/public}"
   [ -n "${HTTPS_HOST:-}" ] || die "saved HTTPS_HOST is empty"
   [ -n "${HTTPS_PORT:-}" ] || die "saved HTTPS_PORT is empty"
   [ -n "${TOKEN:-}" ] || die "saved TOKEN is empty"
@@ -313,15 +318,14 @@ escape_caddy_string() {
 }
 
 write_caddy_site() {
-  local source_dir_escaped
-  source_dir_escaped="$(escape_caddy_string "$SOURCE_DIR")"
+  local public_root_escaped
+  public_root_escaped="$(escape_caddy_string "$PUBLIC_ROOT")"
 
   cat > "$CADDY_SNIPPET" <<EOF
 https://$HTTPS_HOST:$HTTPS_PORT {
     @subfiles path /$TOKEN/clmi.yaml /$TOKEN/sbox.json /$TOKEN/jhsub.txt
     handle @subfiles {
-        uri strip_prefix /$TOKEN
-        root * "$source_dir_escaped"
+        root * "$public_root_escaped"
         file_server
     }
 
@@ -368,6 +372,25 @@ reload_caddy_if_running() {
       rc-service caddy reload || rc-service caddy restart
     fi
   fi
+}
+
+prepare_symlink_tree() {
+  local link_dir file target link_path
+
+  link_dir="$PUBLIC_ROOT/$TOKEN"
+  mkdir -p "$link_dir"
+  chmod 0755 "$DATA_DIR" "$PUBLIC_ROOT" "$link_dir"
+
+  for file in clmi.yaml sbox.json jhsub.txt; do
+    target="$SOURCE_DIR/$file"
+    link_path="$link_dir/$file"
+
+    if [ -e "$link_path" ] && [ ! -L "$link_path" ]; then
+      rm -f "$link_path"
+    fi
+
+    ln -sfn "$target" "$link_path"
+  done
 }
 
 service_status() {
@@ -457,17 +480,22 @@ print_urls() {
 }
 
 print_file_status() {
-  local file path size readable
+  local file path link_path size readable link_state
 
   for file in clmi.yaml sbox.json jhsub.txt; do
     path="$SOURCE_DIR/$file"
+    link_path="$PUBLIC_ROOT/$TOKEN/$file"
     if [ -f "$path" ]; then
       size="$(wc -c < "$path" | tr -d '[:space:]')"
       readable="no"
       [ -r "$path" ] && readable="yes"
-      printf '  %-10s exists, %s bytes, readable=%s\n' "$file" "$size" "$readable"
+      link_state="missing"
+      [ -L "$link_path" ] && link_state="symlink -> $(readlink "$link_path")"
+      printf '  %-10s exists, %s bytes, readable=%s, %s\n' "$file" "$size" "$readable" "$link_state"
     else
-      printf '  %-10s missing\n' "$file"
+      link_state="missing"
+      [ -L "$link_path" ] && link_state="symlink -> $(readlink "$link_path")"
+      printf '  %-10s missing, %s\n' "$file" "$link_state"
     fi
   done
 }
@@ -503,6 +531,7 @@ cmd_install() {
   install_caddy
   grant_acl_on_source
   write_state
+  prepare_symlink_tree
   warn_missing_sources
   ensure_caddy_import
   write_caddy_site
@@ -513,6 +542,7 @@ cmd_install() {
 Installed.
 
 Source dir: $SOURCE_DIR
+Link dir:   $PUBLIC_ROOT/$TOKEN
 Host:       $HTTPS_HOST
 Port:       $HTTPS_PORT
 Token:      $TOKEN
@@ -536,6 +566,7 @@ HTTPS subscription service:
   State:      installed
   Caddy:      $(service_status)
   Source dir: $SOURCE_DIR
+  Link dir:   $PUBLIC_ROOT/$TOKEN
   Host:       $HTTPS_HOST
   Port:       $HTTPS_PORT
   Token:      $TOKEN
@@ -576,6 +607,7 @@ cmd_remove() {
   require_root
 
   rm -f "$CADDY_SNIPPET"
+  rm -rf "$PUBLIC_ROOT"
 
   if command -v caddy >/dev/null 2>&1 && [ -f /etc/caddy/Caddyfile ]; then
     caddy validate --config /etc/caddy/Caddyfile
